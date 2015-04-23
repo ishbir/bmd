@@ -1,7 +1,6 @@
 package memdb
 
 import (
-	"errors"
 	"sort"
 	"sync"
 
@@ -9,11 +8,6 @@ import (
 	"github.com/monetas/bmutil"
 	"github.com/monetas/bmutil/identity"
 	"github.com/monetas/bmutil/wire"
-)
-
-// Errors that the various database functions may return.
-var (
-	ErrDbClosed = errors.New("database is closed")
 )
 
 // counters type serves to enable sorting of uint64 slices using sort.Sort
@@ -41,6 +35,13 @@ func newShaHashFromStr(hexStr string) *wire.ShaHash {
 	return sha
 }
 
+// object is used to represent stored objects in MemDb.
+type object struct {
+	objType wire.ObjectType
+	counter uint64
+	data    []byte
+}
+
 // MemDb is a concrete implementation of the database.Db interface which provides
 // a memory-only database. Since it is memory-only, it is obviously not
 // persistent and is mostly only useful for testing purposes.
@@ -49,12 +50,10 @@ type MemDb struct {
 	sync.Mutex
 
 	// objectsByHash keeps track of objects by their inventory hash.
-	objectsByHash map[wire.ShaHash][]byte
+	objectsByHash map[wire.ShaHash]*object
 
 	// Following fields hold a mapping from counter to shahash for respective
 	// object types.
-	pubKeyByCounter    map[uint64]wire.ShaHash
-	getPubKeyByCounter map[uint64]wire.ShaHash
 	msgByCounter       map[uint64]wire.ShaHash
 	broadcastByCounter map[uint64]wire.ShaHash
 
@@ -70,10 +69,6 @@ func (db *MemDb) getCounterMap(objType wire.ObjectType) map[uint64]wire.ShaHash 
 	var counterMap map[uint64]wire.ShaHash
 
 	switch objType {
-	case wire.ObjectTypeGetPubKey:
-		counterMap = db.getPubKeyByCounter
-	case wire.ObjectTypePubKey:
-		counterMap = db.pubKeyByCounter
 	case wire.ObjectTypeBroadcast:
 		counterMap = db.broadcastByCounter
 	case wire.ObjectTypeMsg:
@@ -94,12 +89,10 @@ func (db *MemDb) Close() error {
 	defer db.Unlock()
 
 	if db.closed {
-		return ErrDbClosed
+		return database.ErrDbClosed
 	}
 
 	db.objectsByHash = nil
-	db.pubKeyByCounter = nil
-	db.getPubKeyByCounter = nil
 	db.msgByCounter = nil
 	db.broadcastByCounter = nil
 	db.closed = true
@@ -114,7 +107,7 @@ func (db *MemDb) ExistsObject(hash *wire.ShaHash) (bool, error) {
 	defer db.Unlock()
 
 	if db.closed {
-		return false, ErrDbClosed
+		return false, database.ErrDbClosed
 	}
 
 	if _, exists := db.objectsByHash[*hash]; exists {
@@ -127,7 +120,7 @@ func (db *MemDb) ExistsObject(hash *wire.ShaHash) (bool, error) {
 // No locks here, meant to be used inside public facing functions.
 func (db *MemDb) fetchObjectByHash(hash *wire.ShaHash) ([]byte, error) {
 	if object, exists := db.objectsByHash[*hash]; exists {
-		return object, nil
+		return object.data, nil
 	}
 
 	return nil, database.ErrNonexistentObject
@@ -144,7 +137,7 @@ func (db *MemDb) FetchObjectByHash(hash *wire.ShaHash) ([]byte, error) {
 	defer db.Unlock()
 
 	if db.closed {
-		return nil, ErrDbClosed
+		return nil, database.ErrDbClosed
 	}
 
 	return db.fetchObjectByHash(hash)
@@ -163,7 +156,7 @@ func (db *MemDb) FetchObjectByCounter(objType wire.ObjectType,
 	defer db.Unlock()
 
 	if db.closed {
-		return nil, ErrDbClosed
+		return nil, database.ErrDbClosed
 	}
 
 	counterMap := db.getCounterMap(objType)
@@ -179,7 +172,7 @@ func (db *MemDb) FetchObjectByCounter(objType wire.ObjectType,
 	if !ok {
 		panic("alien invasion, not supposed to happen (BUG)")
 	}
-	return obj, nil
+	return obj.data, nil
 }
 
 // FetchObjectsFromCounter returns objects from the database, which have a
@@ -307,11 +300,11 @@ func (db *MemDb) RemoveObjectByCounter(wire.ObjectType, uint64) error {
 }
 
 // RollbackClose discards the recent database changes to the previously saved
-// data at last Sync and closes the database.  This is part of the database.Db
+// data at last Sync and closes the database. This is part of the database.Db
 // interface implementation.
 //
 // The database is completely purged on close with this implementation since the
-// entire database is only in memory.  As a result, this function behaves no
+// entire database is only in memory. As a result, this function behaves no
 // differently than Close.
 func (db *MemDb) RollbackClose() error {
 	// Rollback doesn't apply to a memory database, so just call Close.
@@ -320,7 +313,7 @@ func (db *MemDb) RollbackClose() error {
 }
 
 // Sync verifies that the database is coherent on disk and no outstanding
-// transactions are in flight.  This is part of the database.Db interface
+// transactions are in flight. This is part of the database.Db interface
 // implementation.
 //
 // This implementation does not write any data to disk, so this function only
@@ -330,10 +323,10 @@ func (db *MemDb) Sync() error {
 	defer db.Unlock()
 
 	if db.closed {
-		return ErrDbClosed
+		return database.ErrDbClosed
 	}
 
-	// There is nothing extra to do to sync the memory database.  However,
+	// There is nothing extra to do to sync the memory database. However,
 	// the lock is still grabbed to ensure the function does not return
 	// until other operations are complete.
 	return nil
@@ -342,9 +335,7 @@ func (db *MemDb) Sync() error {
 // newMemDb returns a new memory-only database ready for block inserts.
 func newMemDb() *MemDb {
 	db := MemDb{
-		objectsByHash:      make(map[wire.ShaHash][]byte),
-		pubKeyByCounter:    make(map[uint64]wire.ShaHash),
-		getPubKeyByCounter: make(map[uint64]wire.ShaHash),
+		objectsByHash:      make(map[wire.ShaHash]*object),
 		msgByCounter:       make(map[uint64]wire.ShaHash),
 		broadcastByCounter: make(map[uint64]wire.ShaHash),
 	}

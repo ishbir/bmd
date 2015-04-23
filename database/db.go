@@ -10,6 +10,7 @@ import (
 
 // Errors that the various database functions may return.
 var (
+	ErrDbClosed          = errors.New("database is closed")
 	ErrDuplicateObject   = errors.New("duplicate insert attempted")
 	ErrDbDoesNotExist    = errors.New("non-existent database")
 	ErrDbUnknownType     = errors.New("non-existent database type")
@@ -35,16 +36,16 @@ type Db interface {
 
 	// FetchObjectByCounter returns the corresponding object based on the
 	// counter. Note that each object type has a different counter, with unknown
-	// object having none. Meant for used as a convenience method for fetching
-	// new data from database since last check.
+	// object having none. Currently, the only objects to have counters are
+	// messages and broadcasts because they make little sense for anything else.
+	// Counters are meant for used as a convenience method for fetching new data
+	// from database since last check.
 	FetchObjectByCounter(wire.ObjectType, uint64) ([]byte, error)
 
-	// FetchObjectsFromCounter returns `count' objects which have a
-	// counter position starting from `counter'. It also returns the counter
-	// value of the last object. Note that each object type has a different
-	// counter, with unknown object having none. Meant as a convenience method
-	// for fetching new data from database since last check. Objects are
-	// guaranteed to be returned in order of increasing counter.
+	// FetchObjectsFromCounter returns `count' objects which have a counter
+	// position starting from `counter'. It also returns the counter value of
+	// the last object. Objects are guaranteed to be returned in order of
+	// increasing counter.
 	FetchObjectsFromCounter(objType wire.ObjectType, counter uint64,
 		count uint64) ([][]byte, uint64, error)
 
