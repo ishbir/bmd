@@ -65,16 +65,30 @@ type Db interface {
 	// of the given type.
 	GetCounter(wire.ObjectType) (uint64, error)
 
-	// InsertObject inserts data of the given type into the database.
-	InsertObject(wire.ObjectType, []byte) error
+	// InsertObject inserts data of the given type and hash into the database.
+	// It returns the calculated/stored inventory hash as well as the counter
+	// position (if object type has a counter associated with it). If the object
+	// is a PubKey, it inserts it into a separate place where it isn't touched
+	// by RemoveObject or RemoveExpiredObjects and has to be removed using
+	// RemovePubKey.
+	InsertObject([]byte) (*wire.ShaHash, uint64, error)
 
 	// RemoveObject removes the object with the specified hash from the
-	// database.
+	// database. Does not remove PubKeys.
 	RemoveObject(*wire.ShaHash) error
 
 	// RemoveObjectByCounter removes the object with the specified counter value
 	// from the database.
 	RemoveObjectByCounter(wire.ObjectType, uint64) error
+
+	// RemoveExpiredObjects prunes all objects, except PubKey, whose expiry time
+	// has passed (along with a margin of 3 hours).
+	RemoveExpiredObjects() error
+
+	// RemovePubKey removes a PubKey from the PubKey store with the specified
+	// tag. Note that it doesn't touch the general object store and won't remove
+	// the public key from there.
+	RemovePubKey(*wire.ShaHash) error
 
 	// RollbackClose discards the recent database changes to the previously
 	// saved data at last Sync and closes the database.

@@ -1,8 +1,10 @@
 package memdb
 
 import (
+	"bytes"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/monetas/bmd/database"
 	"github.com/monetas/bmutil"
@@ -10,8 +12,12 @@ import (
 	"github.com/monetas/bmutil/wire"
 )
 
+const (
+	panicMessage = "ALIEN INVASION IN PROGRESS. (bug)"
+)
+
 // counters type serves to enable sorting of uint64 slices using sort.Sort
-// function. counters implements sort.Interface.
+// function. Implements sort.Interface.
 type counters []uint64
 
 func (c counters) Len() int {
@@ -35,13 +41,6 @@ func newShaHashFromStr(hexStr string) *wire.ShaHash {
 	return sha
 }
 
-// object is used to represent stored objects in MemDb.
-type object struct {
-	objType wire.ObjectType
-	counter uint64
-	data    []byte
-}
-
 // MemDb is a concrete implementation of the database.Db interface which provides
 // a memory-only database. Since it is memory-only, it is obviously not
 // persistent and is mostly only useful for testing purposes.
@@ -49,13 +48,21 @@ type MemDb struct {
 	// Embed a mutex for safe concurrent access.
 	sync.Mutex
 
-	// objectsByHash keeps track of objects by their inventory hash.
-	objectsByHash map[wire.ShaHash]*object
+	// objectsByHash keeps track of unexpired objects by their inventory hash.
+	objectsByHash map[wire.ShaHash][]byte
+
+	// pubkeyByTag keeps track of all public keys (even expired) by their
+	// tag (which can be calculated from the address).
+	pubKeyByTag map[wire.ShaHash][]byte
 
 	// Following fields hold a mapping from counter to shahash for respective
 	// object types.
-	msgByCounter       map[uint64]wire.ShaHash
-	broadcastByCounter map[uint64]wire.ShaHash
+	msgByCounter       map[uint64]*wire.ShaHash
+	broadcastByCounter map[uint64]*wire.ShaHash
+
+	// keep track of current counter positions (last element added)
+	msgCounterPos       uint64
+	broadcastCounterPos uint64
 
 	// closed indicates whether or not the database has been closed and is
 	// therefore invalidated.
@@ -64,9 +71,9 @@ type MemDb struct {
 
 // getCounterMap is a helper function used to get the map which maps counter to
 // object hash based on `objType'.
-func (db *MemDb) getCounterMap(objType wire.ObjectType) map[uint64]wire.ShaHash {
+func (db *MemDb) getCounterMap(objType wire.ObjectType) map[uint64]*wire.ShaHash {
 	// map which contains the counter to check for
-	var counterMap map[uint64]wire.ShaHash
+	var counterMap map[uint64]*wire.ShaHash
 
 	switch objType {
 	case wire.ObjectTypeBroadcast:
@@ -93,9 +100,12 @@ func (db *MemDb) Close() error {
 	}
 
 	db.objectsByHash = nil
+	db.pubKeyByTag = nil
 	db.msgByCounter = nil
 	db.broadcastByCounter = nil
 	db.closed = true
+	db.msgCounterPos = 0
+	db.broadcastCounterPos = 0
 	return nil
 }
 
@@ -120,7 +130,7 @@ func (db *MemDb) ExistsObject(hash *wire.ShaHash) (bool, error) {
 // No locks here, meant to be used inside public facing functions.
 func (db *MemDb) fetchObjectByHash(hash *wire.ShaHash) ([]byte, error) {
 	if object, exists := db.objectsByHash[*hash]; exists {
-		return object.data, nil
+		return object, nil
 	}
 
 	return nil, database.ErrNonexistentObject
@@ -154,7 +164,6 @@ func (db *MemDb) FetchObjectByCounter(objType wire.ObjectType,
 	counter uint64) ([]byte, error) {
 	db.Lock()
 	defer db.Unlock()
-
 	if db.closed {
 		return nil, database.ErrDbClosed
 	}
@@ -168,11 +177,11 @@ func (db *MemDb) FetchObjectByCounter(objType wire.ObjectType,
 	if !ok {
 		return nil, database.ErrNonexistentObject
 	}
-	obj, ok := db.objectsByHash[hash]
-	if !ok {
-		panic("alien invasion, not supposed to happen (BUG)")
+	obj, err := db.fetchObjectByHash(hash)
+	if err != nil {
+		panic(panicMessage)
 	}
-	return obj.data, nil
+	return obj, nil
 }
 
 // FetchObjectsFromCounter returns objects from the database, which have a
@@ -188,6 +197,9 @@ func (db *MemDb) FetchObjectsFromCounter(objType wire.ObjectType, counter uint64
 	count uint64) ([][]byte, uint64, error) {
 	db.Lock()
 	defer db.Unlock()
+	if db.closed {
+		return nil, 0, database.ErrDbClosed
+	}
 
 	counterMap := db.getCounterMap(objType)
 	if counterMap == nil {
@@ -213,18 +225,21 @@ func (db *MemDb) FetchObjectsFromCounter(objType wire.ObjectType, counter uint64
 	newCounter := keys[len(keys)-1] // counter value of last element
 	objects := make([][]byte, 0, c)
 
-	// start storing objects in ascending order
+	// start fetching objects in ascending order
 	for _, v := range keys {
 		hash := counterMap[v]
-		obj, err := db.fetchObjectByHash(&hash)
+		obj, err := db.fetchObjectByHash(hash)
 		// error checking
 		if err == database.ErrNonexistentObject {
-			panic("alien invasion, not supposed to happen (BUG)")
+			panic(panicMessage)
 		} else if err != nil {
 			return nil, 0, err // mysterious things happening
 		}
-		// store object
-		objects = append(objects, obj)
+		// ensure that database and returned byte arrays are separate
+		objCopy := make([]byte, 0, len(obj))
+		copy(objCopy, obj)
+		// append object to output
+		objects = append(objects, objCopy)
 	}
 
 	return objects, newCounter, nil
@@ -240,6 +255,9 @@ func (db *MemDb) FetchIdentityByAddress(addr *bmutil.Address) (*identity.Public,
 	/*
 		db.Lock()
 		defer db.Unlock()
+		if db.closed {
+			return nil, database.ErrDbClosed
+		}
 
 		for k, v := range db.pubKeyByCounter {
 			hash := db.pubKeyByCounter[v]
@@ -276,27 +294,218 @@ func (db *MemDb) FetchRandomObject() ([]byte, error) {
 	return nil, database.ErrNotImplemented
 }
 
+// getCounterRef returns a reference to object counter of the given object type.
+// It is a convenience method used by various other functions in this package.
+func (db *MemDb) getCounterRef(objType wire.ObjectType) *uint64 {
+	switch objType {
+	case wire.ObjectTypeMsg:
+		return &db.msgCounterPos
+	case wire.ObjectTypeBroadcast:
+		return &db.broadcastCounterPos
+	default:
+		return nil
+	}
+}
+
 // GetCounter returns the highest value of counter that exists for objects
 // of the given type.
-func (db *MemDb) GetCounter(wire.ObjectType) (uint64, error) {
-	return 0, database.ErrNotImplemented
+func (db *MemDb) GetCounter(objType wire.ObjectType) (uint64, error) {
+	db.Lock()
+	defer db.Unlock()
+	if db.closed {
+		return 0, database.ErrDbClosed
+	}
+
+	if c := db.getCounterRef(objType); c != nil {
+		return *c, nil
+	}
+	return 0, database.ErrNotImplemented // incompatible object
 }
 
-// InsertObject inserts data of the given type into the database.
-func (db *MemDb) InsertObject(wire.ObjectType, []byte) error {
-	return database.ErrNotImplemented
+// InsertObject inserts data of the given type and hash into the database.
+// It returns the calculated/stored inventory hash as well as the counter
+// position (if object type has a counter associated with it).
+func (db *MemDb) InsertObject(data []byte) (*wire.ShaHash, uint64, error) {
+	db.Lock()
+	defer db.Unlock()
+	if db.closed {
+		return nil, 0, database.ErrDbClosed
+	}
+
+	_, _, objType, _, _, err := wire.DecodeMsgObjectHeader(bytes.NewReader(data))
+	if err != nil { // impossible, all objects must be valid
+		return nil, 0, err
+	}
+
+	hash, err := wire.NewShaHash(bmutil.CalcInventoryHash(data))
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// ensure that modifying input args doesn't change contents in database
+	dataInsert := make([]byte, 0, len(data))
+	copy(dataInsert, data)
+
+	// handle pubkeys
+	if objType == wire.ObjectTypePubKey {
+		msg := new(wire.MsgPubKey)
+		err = msg.Decode(bytes.NewReader(data))
+		if err != nil {
+			return nil, 0, err
+		}
+
+		var tag []byte
+
+		switch msg.Version {
+		case wire.SimplePubKeyVersion:
+			fallthrough
+		case wire.ExtendedPubKeyVersion:
+			id, err := identity.IdentityFromPubKeyMsg(msg)
+			if err != nil { // invalid encryption/signing keys
+				return nil, 0, err
+			}
+			tag = id.Address.Tag()
+		case wire.EncryptedPubKeyVersion:
+			tag = msg.Tag.Bytes() // directly included
+		}
+		tagH, err := wire.NewShaHash(tag)
+		if err != nil {
+			return nil, 0, err
+		}
+		db.pubKeyByTag[*tagH] = dataInsert // insert pubkey
+	}
+
+	// insert object into the object hash table
+	db.objectsByHash[*hash] = dataInsert
+
+	// get counter map
+	counterMap := db.getCounterMap(objType)
+	counter := db.getCounterRef(objType)
+	if counterMap != nil { // object has a dedicated counter map
+		if counter == nil { // cannot happen
+			panic(panicMessage)
+		}
+		*counter += 1               // increment, new item.
+		counterMap[*counter] = hash // insert to counter map
+	}
+
+	if counter == nil { // err because insert into db could have succeeded and yet produced an error
+		return hash, 0, nil
+	} else {
+		return hash, *counter, nil
+	}
 }
 
-// RemoveObject removes the object with the specified hash from the
-// database.
-func (db *MemDb) RemoveObject(*wire.ShaHash) error {
-	return database.ErrNotImplemented
+// RemoveObject removes the object with the specified hash from the database.
+func (db *MemDb) RemoveObject(hash *wire.ShaHash) error {
+	db.Lock()
+	defer db.Unlock()
+	if db.closed {
+		return database.ErrDbClosed
+	}
+
+	obj, ok := db.objectsByHash[*hash]
+	if !ok {
+		return database.ErrNonexistentObject
+	}
+
+	// check and remove object from counter maps
+	_, _, objType, _, _, err := wire.DecodeMsgObjectHeader(bytes.NewReader(obj))
+	counterMap := db.getCounterMap(objType)
+	if err != nil { // impossible, all objects must be valid
+		panic(panicMessage)
+	}
+	if counterMap != nil {
+		for k, v := range counterMap { // go through each element
+			if v.IsEqual(hash) { // we got a match, so delete
+				delete(counterMap, k)
+				break
+			}
+		}
+	}
+
+	// remove object from object map
+	delete(db.objectsByHash, *hash) // done!
+
+	return nil
 }
 
 // RemoveObjectByCounter removes the object with the specified counter value
 // from the database.
-func (db *MemDb) RemoveObjectByCounter(wire.ObjectType, uint64) error {
-	return database.ErrNotImplemented
+func (db *MemDb) RemoveObjectByCounter(objType wire.ObjectType,
+	counter uint64) error {
+
+	db.Lock()
+	defer db.Unlock()
+	if db.closed {
+		return database.ErrDbClosed
+	}
+
+	counterMap := db.getCounterMap(objType)
+	if counterMap == nil { // undefined operation
+		return database.ErrNotImplemented
+	}
+
+	hash, ok := counterMap[counter]
+	if !ok {
+		return database.ErrNonexistentObject
+	}
+
+	delete(counterMap, counter)     // delete counter reference
+	delete(db.objectsByHash, *hash) // delete object itself
+	return nil
+}
+
+// RemoveExpiredObjects prunes all objects, except PubKey, whose expiry time
+// has passed (along with a margin of 3 hours).
+func (db *MemDb) RemoveExpiredObjects() error {
+	db.Lock()
+	defer db.Unlock()
+	if db.closed {
+		return database.ErrDbClosed
+	}
+
+	for hash, obj := range db.objectsByHash {
+		_, expiresTime, objType, _, _, err := wire.DecodeMsgObjectHeader(bytes.NewReader(obj))
+		if err != nil { // impossible, all objects must be valid
+			panic(panicMessage)
+		}
+		// current time + 3 hours
+		if time.Now().Add(time.Hour * 3).After(expiresTime) { // expired
+			counterMap := db.getCounterMap(objType)
+			if counterMap != nil {
+				for k, v := range counterMap { // go through each element
+					if v.IsEqual(&hash) { // we got a match, so delete
+						delete(counterMap, k)
+						break
+					}
+				}
+			}
+
+			// remove object from object map
+			delete(db.objectsByHash, hash)
+		}
+	}
+	return nil
+}
+
+// RemovePubKey removes a PubKey from the PubKey store with the specified
+// tag. Note that it doesn't touch the general object store and won't remove
+// the public key from there.
+func (db *MemDb) RemovePubKey(tag *wire.ShaHash) error {
+	db.Lock()
+	defer db.Unlock()
+	if db.closed {
+		return database.ErrDbClosed
+	}
+
+	_, ok := db.pubKeyByTag[*tag]
+	if !ok {
+		return database.ErrNonexistentObject
+	}
+
+	delete(db.pubKeyByTag, *tag) // remove
+	return nil
 }
 
 // RollbackClose discards the recent database changes to the previously saved
@@ -335,9 +544,12 @@ func (db *MemDb) Sync() error {
 // newMemDb returns a new memory-only database ready for block inserts.
 func newMemDb() *MemDb {
 	db := MemDb{
-		objectsByHash:      make(map[wire.ShaHash]*object),
-		msgByCounter:       make(map[uint64]wire.ShaHash),
-		broadcastByCounter: make(map[uint64]wire.ShaHash),
+		objectsByHash:       make(map[wire.ShaHash][]byte),
+		pubKeyByTag:         make(map[wire.ShaHash][]byte),
+		msgByCounter:        make(map[uint64]*wire.ShaHash),
+		broadcastByCounter:  make(map[uint64]*wire.ShaHash),
+		msgCounterPos:       0,
+		broadcastCounterPos: 0,
 	}
 	return &db
 }
