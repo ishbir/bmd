@@ -7,7 +7,7 @@ import (
 
 	"github.com/monetas/bmutil/wire"
 
-	_ "github.com/btcsuite/btcd/database/memdb"
+	_ "github.com/monetas/bmd/database/memdb"
 	"github.com/monetas/bmd/database"
 )
 
