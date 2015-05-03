@@ -41,6 +41,19 @@ func newShaHashFromStr(hexStr string) *wire.ShaHash {
 	return sha
 }
 
+// counter includes a map to a kind of object and
+type counter struct {
+	// holds a mapping from counter to shahash for some object types.
+	ByCounter map[uint64]*wire.ShaHash
+	// keep track of current counter positions (last element added)
+	CounterPos uint64
+}
+
+func (cmap *counter) Insert(hash *wire.ShaHash) {
+	cmap.CounterPos += 1                   // increment, new item.
+	cmap.ByCounter[cmap.CounterPos] = hash // insert to counter map
+}
+
 // MemDb is a concrete implementation of the database.Db interface which provides
 // a memory-only database. Since it is memory-only, it is obviously not
 // persistent and is mostly only useful for testing purposes.
@@ -55,14 +68,14 @@ type MemDb struct {
 	// tag (which can be calculated from the address).
 	pubKeyByTag map[wire.ShaHash][]byte
 
-	// Following fields hold a mapping from counter to shahash for respective
-	// object types.
-	msgByCounter       map[uint64]*wire.ShaHash
-	broadcastByCounter map[uint64]*wire.ShaHash
+	// counters for respective object types.
+	msgCounter       *counter
+	broadcastCounter *counter
+	pubKeyCounter    *counter
+	getPubKeyCounter *counter
 
-	// keep track of current counter positions (last element added)
-	msgCounterPos       uint64
-	broadcastCounterPos uint64
+	// counters for unknown objects.
+	unknownObjCounter map[wire.ObjectType]*counter
 
 	// closed indicates whether or not the database has been closed and is
 	// therefore invalidated.
@@ -71,19 +84,26 @@ type MemDb struct {
 
 // getCounterMap is a helper function used to get the map which maps counter to
 // object hash based on `objType'.
-func (db *MemDb) getCounterMap(objType wire.ObjectType) map[uint64]*wire.ShaHash {
-	// map which contains the counter to check for
-	var counterMap map[uint64]*wire.ShaHash
+func (db *MemDb) getCounterMap(objType wire.ObjectType) *counter {
 
 	switch objType {
 	case wire.ObjectTypeBroadcast:
-		counterMap = db.broadcastByCounter
+		return db.broadcastCounter
 	case wire.ObjectTypeMsg:
-		counterMap = db.msgByCounter
+		return db.msgCounter
+	case wire.ObjectTypePubKey:
+		return db.pubKeyCounter
+	case wire.ObjectTypeGetPubKey:
+		return db.getPubKeyCounter
 	default:
-		counterMap = nil
+		var count *counter
+		var ok bool
+		if count, ok = db.unknownObjCounter[objType]; !ok {
+			count = &counter{make(map[uint64]*wire.ShaHash), 0}
+			db.unknownObjCounter[objType] = count
+		}
+		return count
 	}
-	return counterMap
 }
 
 // Close cleanly shuts down database.  This is part of the database.Db interface
@@ -101,11 +121,12 @@ func (db *MemDb) Close() error {
 
 	db.objectsByHash = nil
 	db.pubKeyByTag = nil
-	db.msgByCounter = nil
-	db.broadcastByCounter = nil
+	db.msgCounter = nil
+	db.broadcastCounter = nil
+	db.pubKeyCounter = nil
+	db.getPubKeyCounter = nil
+	db.unknownObjCounter = nil
 	db.closed = true
-	db.msgCounterPos = 0
-	db.broadcastCounterPos = 0
 	return nil
 }
 
@@ -173,7 +194,9 @@ func (db *MemDb) FetchObjectByCounter(objType wire.ObjectType,
 		return nil, database.ErrNotImplemented
 	}
 
-	hash, ok := counterMap[counter]
+	//fmt.Printf("fetching object by counter. Type %d, counter %d\n", objType, counter)
+	//fmt.Println("got this counter object: ", counterMap.ByCounter)
+	hash, ok := counterMap.ByCounter[counter]
 	if !ok {
 		return nil, database.ErrNonexistentObject
 	}
@@ -211,7 +234,7 @@ func (db *MemDb) FetchObjectsFromCounter(objType wire.ObjectType, counter uint64
 	keys := make([]uint64, 0, count)
 
 	// make a slice of keys to retrieve
-	for k := range counterMap {
+	for k := range counterMap.ByCounter {
 		if k < counter { // discard this element
 			continue
 		}
@@ -221,13 +244,18 @@ func (db *MemDb) FetchObjectsFromCounter(objType wire.ObjectType, counter uint64
 		keys = append(keys, k)
 		c += 1
 	}
-	sort.Sort(counters(keys))       // sort retrieved keys
-	newCounter := keys[len(keys)-1] // counter value of last element
+	sort.Sort(counters(keys)) // sort retrieved keys
+	var newCounter uint64
+	if len(keys) == 0 {
+		newCounter = 0
+	} else {
+		newCounter = keys[len(keys)-1] // counter value of last element
+	}
 	objects := make([][]byte, 0, c)
 
 	// start fetching objects in ascending order
 	for _, v := range keys {
-		hash := counterMap[v]
+		hash := counterMap.ByCounter[v]
 		obj, err := db.fetchObjectByHash(hash)
 		// error checking
 		if err == database.ErrNonexistentObject {
@@ -236,7 +264,7 @@ func (db *MemDb) FetchObjectsFromCounter(objType wire.ObjectType, counter uint64
 			return nil, 0, err // mysterious things happening
 		}
 		// ensure that database and returned byte arrays are separate
-		objCopy := make([]byte, 0, len(obj))
+		objCopy := make([]byte, len(obj))
 		copy(objCopy, obj)
 		// append object to output
 		objects = append(objects, objCopy)
@@ -297,14 +325,11 @@ func (db *MemDb) FetchRandomObject() ([]byte, error) {
 // getCounterRef returns a reference to object counter of the given object type.
 // It is a convenience method used by various other functions in this package.
 func (db *MemDb) getCounterRef(objType wire.ObjectType) *uint64 {
-	switch objType {
-	case wire.ObjectTypeMsg:
-		return &db.msgCounterPos
-	case wire.ObjectTypeBroadcast:
-		return &db.broadcastCounterPos
-	default:
-		return nil
+	counterMap := db.getCounterMap(objType)
+	if counterMap == nil { // Should not happen.
+		panic(panicMessage)
 	}
+	return &(counterMap.CounterPos)
 }
 
 // GetCounter returns the highest value of counter that exists for objects
@@ -343,8 +368,10 @@ func (db *MemDb) InsertObject(data []byte) (*wire.ShaHash, uint64, error) {
 	}
 
 	// ensure that modifying input args doesn't change contents in database
-	dataInsert := make([]byte, 0, len(data))
+	dataInsert := make([]byte, len(data))
 	copy(dataInsert, data)
+
+	//fmt.Println("inserting object ", dataInsert, " into counter map ", objType)
 
 	// handle pubkeys
 	if objType == wire.ObjectTypePubKey {
@@ -380,19 +407,12 @@ func (db *MemDb) InsertObject(data []byte) (*wire.ShaHash, uint64, error) {
 
 	// get counter map
 	counterMap := db.getCounterMap(objType)
-	counter := db.getCounterRef(objType)
-	if counterMap != nil { // object has a dedicated counter map
-		if counter == nil { // cannot happen
-			panic(panicMessage)
-		}
-		*counter += 1               // increment, new item.
-		counterMap[*counter] = hash // insert to counter map
-	}
 
-	if counter == nil { // err because insert into db could have succeeded and yet produced an error
+	if counterMap == nil { // err because insert into db could have succeeded and yet produced an error
 		return hash, 0, nil
 	} else {
-		return hash, *counter, nil
+		counterMap.Insert(hash)
+		return hash, counterMap.CounterPos, nil
 	}
 }
 
@@ -416,9 +436,9 @@ func (db *MemDb) RemoveObject(hash *wire.ShaHash) error {
 		panic(panicMessage)
 	}
 	if counterMap != nil {
-		for k, v := range counterMap { // go through each element
+		for k, v := range counterMap.ByCounter { // go through each element
 			if v.IsEqual(hash) { // we got a match, so delete
-				delete(counterMap, k)
+				delete(counterMap.ByCounter, k)
 				break
 			}
 		}
@@ -446,13 +466,13 @@ func (db *MemDb) RemoveObjectByCounter(objType wire.ObjectType,
 		return database.ErrNotImplemented
 	}
 
-	hash, ok := counterMap[counter]
+	hash, ok := counterMap.ByCounter[counter]
 	if !ok {
 		return database.ErrNonexistentObject
 	}
 
-	delete(counterMap, counter)     // delete counter reference
-	delete(db.objectsByHash, *hash) // delete object itself
+	delete(counterMap.ByCounter, counter) // delete counter reference
+	delete(db.objectsByHash, *hash)       // delete object itself
 	return nil
 }
 
@@ -470,13 +490,13 @@ func (db *MemDb) RemoveExpiredObjects() error {
 		if err != nil { // impossible, all objects must be valid
 			panic(panicMessage)
 		}
-		// current time + 3 hours
-		if time.Now().Add(time.Hour * 3).After(expiresTime) { // expired
+		// current time - 3 hours
+		if time.Now().Add(-time.Hour*3).After(expiresTime) && objType != wire.ObjectTypePubKey { // expired
 			counterMap := db.getCounterMap(objType)
 			if counterMap != nil {
-				for k, v := range counterMap { // go through each element
+				for k, v := range counterMap.ByCounter { // go through each element
 					if v.IsEqual(&hash) { // we got a match, so delete
-						delete(counterMap, k)
+						delete(counterMap.ByCounter, k)
 						break
 					}
 				}
@@ -544,12 +564,13 @@ func (db *MemDb) Sync() error {
 // newMemDb returns a new memory-only database ready for block inserts.
 func newMemDb() *MemDb {
 	db := MemDb{
-		objectsByHash:       make(map[wire.ShaHash][]byte),
-		pubKeyByTag:         make(map[wire.ShaHash][]byte),
-		msgByCounter:        make(map[uint64]*wire.ShaHash),
-		broadcastByCounter:  make(map[uint64]*wire.ShaHash),
-		msgCounterPos:       0,
-		broadcastCounterPos: 0,
+		objectsByHash:     make(map[wire.ShaHash][]byte),
+		pubKeyByTag:       make(map[wire.ShaHash][]byte),
+		msgCounter:        &counter{make(map[uint64]*wire.ShaHash), 0},
+		broadcastCounter:  &counter{make(map[uint64]*wire.ShaHash), 0},
+		pubKeyCounter:     &counter{make(map[uint64]*wire.ShaHash), 0},
+		getPubKeyCounter:  &counter{make(map[uint64]*wire.ShaHash), 0},
+		unknownObjCounter: make(map[wire.ObjectType]*counter),
 	}
 	return &db
 }
