@@ -128,14 +128,28 @@ func (om *ObjectManager) handleObjectMsg(omsg *objectMsg) {
 
 	delete(om.requestedObjects, *invVect)
 
-	// check PoW
+	// Check PoW.
 	obj := wire.EncodeMessage(omsg.object)
-	if pow.Check(obj, pow.DefaultExtraBytes, pow.DefaultNonceTrialsPerByte,
+	if !pow.Check(obj, pow.DefaultExtraBytes, pow.DefaultNonceTrialsPerByte,
 		time.Now()) {
-		om.server.db.InsertObject(obj)
+		return // invalid PoW
 	}
 
 	peerLog.Debugf(omsg.peer.peer.PrependAddr(fmt.Sprint("Object ", invVect.Hash.String()[:8], " received.")))
+
+	// Insert object into database.
+	counter, err := om.server.db.InsertObject(obj)
+	if err != nil {
+		dbLog.Errorf("failed to insert object: %v", err)
+		return
+	}
+
+	// Notify RPC server
+	if !cfg.DisableRPC {
+		om.server.rpcServer.NotifyObject(obj, counter)
+	}
+
+	// Advertise objects to other peers.
 	om.server.handleRelayInvMsg(invVect)
 }
 
