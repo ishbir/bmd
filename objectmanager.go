@@ -151,7 +151,7 @@ func (om *ObjectManager) handleObjectMsg(omsg *objectMsg) {
 		// an attack by checking that objects came from peers that we requested
 		// from.
 		objmgrLog.Error(omsg.peer.addr.String(),
-			" Disconnecting because of unrequested object ", invVect.Hash.String()[:8], " received.")
+			" Disconnecting because unrequested object ", invVect.Hash.String()[:8], " received.")
 		omsg.peer.disconnect()
 		return
 	}
