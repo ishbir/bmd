@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -115,14 +116,29 @@ type OutboundHandshakePeerTester struct {
 	handshakeComplete bool
 	response          *PeerAction
 	msgAddr           wire.Message
+	mutex             sync.RWMutex
 }
 
 func (peer *OutboundHandshakePeerTester) OnStart() *PeerAction {
 	return nil
 }
 
+func (peer *OutboundHandshakePeerTester) VersionReceived() bool {
+	peer.mutex.RLock()
+	defer peer.mutex.RUnlock()
+
+	return peer.versionReceived
+}
+
+func (peer *OutboundHandshakePeerTester) HandshakeComplete() bool {
+	peer.mutex.RLock()
+	defer peer.mutex.RUnlock()
+
+	return peer.handshakeComplete
+}
+
 func (peer *OutboundHandshakePeerTester) OnMsgVersion(version *wire.MsgVersion) *PeerAction {
-	if peer.versionReceived {
+	if peer.VersionReceived() {
 		return &PeerAction{Err: errors.New("Two version messages received")}
 	}
 	peer.versionReceived = true
@@ -130,10 +146,12 @@ func (peer *OutboundHandshakePeerTester) OnMsgVersion(version *wire.MsgVersion) 
 }
 
 func (peer *OutboundHandshakePeerTester) OnMsgVerAck(p *wire.MsgVerAck) *PeerAction {
-	if !peer.versionReceived {
+	if !peer.VersionReceived() {
 		return &PeerAction{Err: errors.New("Expecting version message first.")}
 	}
+	peer.mutex.Lock()
 	peer.handshakeComplete = true
+	peer.mutex.Unlock()
 	return &PeerAction{
 		Messages:            []wire.Message{peer.msgAddr},
 		InteractionComplete: true,
@@ -142,28 +160,28 @@ func (peer *OutboundHandshakePeerTester) OnMsgVerAck(p *wire.MsgVerAck) *PeerAct
 }
 
 func (peer *OutboundHandshakePeerTester) OnMsgAddr(p *wire.MsgAddr) *PeerAction {
-	if peer.handshakeComplete {
+	if peer.HandshakeComplete() {
 		return nil
 	}
 	return &PeerAction{Err: errors.New("Not allowed before handshake is complete.")}
 }
 
 func (peer *OutboundHandshakePeerTester) OnMsgInv(p *wire.MsgInv) *PeerAction {
-	if peer.handshakeComplete {
+	if peer.HandshakeComplete() {
 		return nil
 	}
 	return &PeerAction{Err: errors.New("Not allowed before handshake is complete.")}
 }
 
 func (peer *OutboundHandshakePeerTester) OnMsgGetData(p *wire.MsgGetData) *PeerAction {
-	if peer.handshakeComplete {
+	if peer.HandshakeComplete() {
 		return nil
 	}
 	return &PeerAction{Err: errors.New("Not allowed before handshake is complete.")}
 }
 
 func (peer *OutboundHandshakePeerTester) OnSendData(invVect []*wire.InvVect) *PeerAction {
-	if peer.handshakeComplete {
+	if peer.HandshakeComplete() {
 		return nil
 	}
 	return &PeerAction{Err: errors.New("Object message not allowed before handshake is complete.")}
@@ -507,6 +525,9 @@ type MockConnection struct {
 
 	// Whether the report has already been submitted.
 	reported int32
+
+	// A mutex for data that might be accessed by different threads.
+	mutex sync.RWMutex
 }
 
 func (mock *MockConnection) ReadMessage() (wire.Message, error) {
@@ -537,7 +558,10 @@ func (mock *MockConnection) ReadMessage() (wire.Message, error) {
 func (mock *MockConnection) WriteMessage(rmsg wire.Message) error {
 	// We can keep receiving messages after the interaction is done; we just
 	// ignore them.	 We are waiting to see whether the peer disconnects.
-	if mock.interactionComplete {
+	mock.mutex.RLock()
+	ic := mock.interactionComplete
+	mock.mutex.RUnlock()
+	if ic {
 		return nil
 	}
 
@@ -549,7 +573,10 @@ func (mock *MockConnection) WriteMessage(rmsg wire.Message) error {
 func (mock *MockConnection) RequestData(invVect []*wire.InvVect) error {
 	// We can keep receiving messages after the interaction is done; we just ignore them.
 	// We are waiting to see whether the peer disconnects.
-	if mock.interactionComplete {
+	mock.mutex.RLock()
+	ic := mock.interactionComplete
+	mock.mutex.RUnlock()
+	if ic {
 		return nil
 	}
 
@@ -627,9 +654,11 @@ func (mock *MockConnection) handleAction(action *PeerAction) {
 		return
 	}
 
+	mock.mutex.Lock()
 	mock.interactionComplete = mock.interactionComplete || action.InteractionComplete
 
 	mock.disconnectExpected = mock.disconnectExpected || action.DisconnectExpected
+	mock.mutex.Unlock()
 
 	if action.Messages != nil {
 		mock.reply <- action.Messages
@@ -638,7 +667,10 @@ func (mock *MockConnection) handleAction(action *PeerAction) {
 
 // ConnectionClosed is called when the real peer closes the connection to the mock peer.
 func (mock *MockConnection) ConnectionClosed() {
-	if !mock.interactionComplete &&
+	mock.mutex.RLock()
+	ic := mock.interactionComplete
+	mock.mutex.RUnlock()
+	if !ic &&
 		(!mock.disconnectExpected ||
 			(mock.msgQueue != nil && mock.queuePlace < len(mock.msgQueue))) {
 		mock.Done(errors.New("Connection closed prematurely."))
@@ -653,7 +685,9 @@ func (mock *MockConnection) Done(err error) {
 		return
 	}
 	mock.timer.Stop()
+	mock.mutex.Lock()
 	mock.interactionComplete = true
+	mock.mutex.Unlock()
 	mock.report <- TestReport{err, mock.objectData}
 }
 
@@ -665,9 +699,11 @@ func (mock *MockConnection) BeginTest() {
 		return
 	}
 
+	mock.mutex.Lock()
 	mock.interactionComplete = mock.interactionComplete || action.InteractionComplete
 
 	mock.disconnectExpected = mock.disconnectExpected || action.DisconnectExpected
+	mock.mutex.Unlock()
 
 	if action.Messages == nil {
 		return
@@ -692,7 +728,10 @@ func NewMockConnection(localAddr, remoteAddr net.Addr, report chan TestReport, p
 	}
 
 	mock.timer = time.AfterFunc(time.Millisecond*100, func() {
-		if !mock.interactionComplete {
+		mock.mutex.RLock()
+		ic := mock.interactionComplete
+		mock.mutex.RUnlock()
+		if !ic {
 			if mock.disconnectExpected {
 				mock.Done(errors.New("Peer stopped interacting when it was expected to disconnect."))
 			} else {
