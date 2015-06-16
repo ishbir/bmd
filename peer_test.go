@@ -812,9 +812,7 @@ func getMemDb(msgs []*wire.MsgObject) database.Db {
 	return db
 }
 
-var expires = time.Now().Add(2 * time.Minute)
-
-//var expired = time.Now().Add(-10 * time.Minute).Add(-3 * time.Hour)
+var expires = time.Now().Add(5 * time.Minute)
 
 // A set of pub keys to create fake objects for testing the database.
 var pubkey = []wire.PubKey{
@@ -904,6 +902,15 @@ func init() {
 		binary.BigEndian.PutUint64(b, nonce)
 		testObj[i], _ = wire.DecodeMsgObject(b)
 	}
+
+	// Load config
+	var err error
+	cfg, _, err = loadConfig(true)
+	if err != nil {
+		panic("Config failed to load.")
+	}
+	cfg.MaxPeers = 1
+	cfg.DisableDNSSeed = true
 }
 
 // TestOutboundPeerHandshake tests the initial handshake for an outbound peer, ie,
@@ -977,16 +984,7 @@ func TestOutboundPeerHandshake(t *testing.T) {
 		}
 	}
 
-	// Load config.
-	var err error
-	cfg, _, err = loadConfig(true)
-	if err != nil {
-		t.Fatalf("Config failed to load.")
-	}
-	cfg.MaxPeers = 1
 	cfg.ConnectPeers = []string{"5.45.99.75:8444"}
-	cfg.DisableDNSSeed = true
-	defer backendLog.Flush()
 
 	for testCase, response := range responses {
 		defer resetCfg(cfg)()
@@ -1016,6 +1014,7 @@ func TestOutboundPeerHandshake(t *testing.T) {
 		<-testDone
 	}
 
+	cfg.ConnectPeers = []string{}
 	NewConn = peer.NewConnection
 }
 
@@ -1086,16 +1085,6 @@ func TestInboundPeerHandshake(t *testing.T) {
 			DisconnectExpected:  false,
 		},
 	}
-
-	// Load config.
-	var err error
-	cfg, _, err = loadConfig(true)
-	if err != nil {
-		t.Fatalf("Config failed to load.")
-	}
-	cfg.MaxPeers = 1
-	cfg.DisableDNSSeed = true
-	defer backendLog.Flush()
 
 	for testCase, open := range openingMsg {
 		defer resetCfg(cfg)()
@@ -1191,16 +1180,6 @@ func TestProcessAddr(t *testing.T) {
 			0,
 		},
 	}
-
-	// Load config.
-	var err error
-	cfg, _, err = loadConfig(true)
-	if err != nil {
-		t.Fatalf("Config failed to load.")
-	}
-	cfg.MaxPeers = 1
-	cfg.DisableDNSSeed = true
-	defer backendLog.Flush()
 
 	for testCase, addrTest := range AddrTests {
 		defer resetCfg(cfg)()
@@ -1388,16 +1367,6 @@ func TestProcessInvAndObjectExchange(t *testing.T) {
 	// Some parameters for the test sequence.
 	localAddr := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8333}
 	remoteAddr := &net.TCPAddr{IP: net.ParseIP("192.168.0.1"), Port: 8333}
-
-	// Load config.
-	var err error
-	cfg, _, err = loadConfig(true)
-	if err != nil {
-		t.Fatalf("Config failed to load.")
-	}
-	cfg.MaxPeers = 1
-	cfg.DisableDNSSeed = true
-	defer backendLog.Flush()
 
 	for testCase, test := range tests {
 		defer resetCfg(cfg)()
