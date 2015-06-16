@@ -242,7 +242,7 @@ func TestRPCConnection(t *testing.T) {
 	cfg.RPCLimitPass = rpcLimitPass
 	cfg.DisableRPC = false
 	cfg.DisableTLS = true
-	cfg.RPCMaxClients = 2
+	cfg.RPCMaxClients = 1
 	defer resetCfg(cfg)()
 
 	// Load rpc listeners.
@@ -280,6 +280,9 @@ func TestRPCConnection(t *testing.T) {
 	rpcTests(client, t)
 	client.Close() // we're done
 	ws.Close()
+
+	// Let server register disconnection
+	<-time.NewTimer(time.Millisecond * 20).C
 
 	// Test for authentication timeout.
 	ws, _, err = websocket.DefaultDialer.Dial(rpcLoc, nil)
